@@ -1,0 +1,25 @@
+services:              # コンテナの定義開始
+  db:                  # PostgreSQLコンテナ（サービス名: db）
+    image: postgres:16 # PostgreSQL 16の公式イメージを使用
+    environment:       # コンテナに渡す環境変数
+      POSTGRES_USER: postgres       # DBのユーザー名
+      POSTGRES_PASSWORD: devicehub  # DBのパスワード
+      POSTGRES_DB: devicehub        # 起動時に自動作成するDB名
+    volumes:           # データの永続化
+      - pgdata:/var/lib/postgresql/data              # DBデータをVolumeに保存
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql  # 初回起動時にschema.sqlを自動実行
+    ports:
+      - "5432:5432"    # ホスト:5432 → コンテナ:5432
+
+  backend:             # FastAPIコンテナ（サービス名: backend）
+    build: .           # カレントディレクトリのDockerfileからイメージをビルド
+    ports:
+      - "8000:8000"    # ホスト:8000 → コンテナ:8000
+    depends_on:
+      - db             # dbコンテナが先に起動してからbackendを起動
+    environment:
+      DB_URL: "host=db port=5432 dbname=devicehub user=postgres password=devicehub"
+                        # ↑ host=db が重要！コンテナネットワーク内のサービス名で通信する
+
+volumes:               # Volume定義（トップレベル）
+  pgdata:              # pgdataという名前のVolumeを作成
