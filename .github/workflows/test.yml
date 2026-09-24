@@ -1,0 +1,114 @@
+# ============================================================================
+# DeviceHub の GitHub Actions ワークフロー
+# ============================================================================
+#
+# このファイルは「push されたら自動でテストを走らせる」設定です。
+# GitHub が .github/workflows/ ディレクトリ内の YAML ファイルを自動認識します。
+#
+# 流れ:
+#   1. コードが push される
+#   2. GitHub が仮想サーバー（runner）を立ち上げる
+#   3. PostgreSQL サービスコンテナを起動する
+#   4. コードをチェックアウトする
+#   5. Python 環境をセットアップする
+#   6. 依存パッケージをインストールする
+#   7. DB にスキーマを作成する
+#   8. pytest でテストを実行する
+#
+# 結果は GitHub リポジトリの「Actions」タブで確認できます。
+
+# ============================================================================
+# ワークフロー名（GitHub の Actions タブに表示される）
+# ============================================================================
+name: Test
+
+# ============================================================================
+# トリガー（いつ実行するか）
+# ============================================================================
+on:
+  # main ブランチに push されたら実行
+  push:
+    branches:
+      - main
+
+  # main ブランチへ Pull Request が作られたら実行
+  pull_request:
+    branches:
+      - main
+
+# ============================================================================
+# ジョブ（実行する処理のまとまり）
+# ============================================================================
+jobs:
+  test:
+    # ジョブ名
+    name: Run tests
+
+    # 実行環境（Ubuntu の最新版）
+    runs-on: ubuntu-latest
+
+    # --------------------------------------------------------------------------
+    # サービスコンテナ（テスト用の PostgreSQL）
+    # --------------------------------------------------------------------------
+    # GitHub Actions では「サービスコンテナ」を使って、
+    # テスト用のデータベースを簡単に立ち上げられます。
+    # Docker Compose の db サービスと同じようなものです。
+    services:
+      postgres:
+        # PostgreSQL 16 イメージ（Docker Compose と同じバージョン）
+        image: postgres:16
+
+        # 環境変数（Docker Compose の environment と同じ）
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: devicehub
+          POSTGRES_DB: devicehub
+
+        # ポートマッピング
+        # GitHub Actions のサービスコンテナでは ports を使わず、
+        # 直接ホスト名でアクセスする（host=localhost ではなく services.postgres ではなく localhost）
+        ports:
+          - 5432:5432
+
+        # ヘルスチェック（PostgreSQL が起動完了するまで待つ）
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # --------------------------------------------------------------------------
+    # ステップ（ジョブの中の個別コマンド）
+    # --------------------------------------------------------------------------
+    steps:
+      # Step 1: コードをチェックアウト（GitHub リポジトリから取得）
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Python 環境をセットアップ
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Step 3: 依存パッケージをインストール
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Step 4: PostgreSQL にスキーマを作成
+      # schema.sql を PostgreSQL に流し込んでテーブルを作成
+      - name: Initialize database schema
+        run: |
+          PGPASSWORD=devicehub psql \
+            -h localhost \
+            -U postgres \
+            -d devicehub \
+            -f schema.sql
+
+      # Step 5: テストを実行
+      # DB_URL 環境変数を設定してから pytest を実行
+      # host=localhost は GitHub Actions のサービスコンテナに接続するため
+      - name: Run tests
+        env:
+          DB_URL: "host=localhost port=5432 dbname=devicehub user=postgres password=devicehub"
+        run: python -m pytest test_main.py -v
