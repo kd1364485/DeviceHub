@@ -23,8 +23,13 @@ import os
 # 無ければローカル開発用のデフォルト値を使う（WSL2 の PostgreSQL）
 DB_URL = os.environ.get("DB_URL", "host=127.0.0.1 port=5432 dbname=devicehub user=postgres password=devicehub")
 
-# APIキー（認証用。本来は環境変数で管理すべきだが、学習用に固定値）
-API_KEY = "my-secret-key"
+# APIキー（認証用）
+# 環境変数 API_KEY があればそれを使う。無ければ学習用の固定値（本番では必ず環境変数で渡す）
+API_KEY = os.environ.get("API_KEY", "my-secret-key")
+
+# 最後の heartbeat からこの秒数以内なら ONLINE、超えたら OFFLINE
+# エージェントは 30 秒ごとに送るので、1 回取りこぼしても ONLINE のままになる長さにしている
+ONLINE_THRESHOLD_SECONDS = int(os.environ.get("ONLINE_THRESHOLD_SECONDS", "60"))
 
 
 # ============================================================================
@@ -47,7 +52,7 @@ from psycopg.rows import dict_row
 from psycopg.errors import UniqueViolation, ForeignKeyViolation
 
 # FastAPI: Web API フレームワーク
-from fastapi import FastAPI, HTTPException, Response, status, Header
+from fastapi import Depends, FastAPI, HTTPException, Response, status, Header
 
 # Pydantic: リクエスト/レスポンスのデータ形（スキーマ）を定義
 from pydantic import BaseModel, Field
@@ -98,7 +103,10 @@ class DevicePatch(BaseModel):
 
 
 class DeviceResponse(BaseModel):
-    """デバイス取得時のレスポンスボディ。cpu を追加。"""
+    """デバイス取得時のレスポンスボディ。cpu を追加。
+
+    v1.0 から、最後の heartbeat の時刻と、そこから判定した状態（ONLINE / OFFLINE）を返す。
+    """
     id: int
     user_id: int
     hostname: str
@@ -107,6 +115,8 @@ class DeviceResponse(BaseModel):
     gpu: str
     memory_gb: int
     created_at: datetime
+    last_heartbeat_at: datetime | None   # 一度も heartbeat が無ければ None
+    status: str                          # "ONLINE" または "OFFLINE"
 
 
 # ============================================================================
@@ -135,13 +145,64 @@ def get_db():
     return conn
 
 
+# デバイスを、最後の heartbeat と状態つきで取り出す SELECT。
+# 1 つ目の %s は ONLINE とみなす秒数（ONLINE_THRESHOLD_SECONDS）。
+#
+# LEFT JOIN LATERAL: デバイス 1 行ごとに、そのデバイスの heartbeat の最新時刻を求める。
+#   heartbeat が 1 件も無いデバイスも残す（LEFT JOIN）。その場合 last_heartbeat_at は NULL → OFFLINE。
+# 判定は DB の NOW() と比べる。アプリと DB で時計やタイムゾーンがずれても、判定がぶれない。
+DEVICE_SELECT = """
+    SELECT d.id, d.user_id, d.hostname, d.os, d.cpu, d.gpu, d.memory_gb, d.created_at,
+           hb.last_heartbeat_at,
+           CASE WHEN hb.last_heartbeat_at >= NOW() - make_interval(secs => %s)
+                THEN 'ONLINE' ELSE 'OFFLINE' END AS status
+    FROM devices d
+    LEFT JOIN LATERAL (
+        SELECT MAX(created_at) AS last_heartbeat_at
+        FROM heartbeats
+        WHERE device_id = d.id
+    ) hb ON true
+"""
+
+
+def select_device(cur, device_id: int):
+    """1 台のデバイスを、状態つきで取り出す。無ければ None。"""
+    cur.execute(DEVICE_SELECT + " WHERE d.id = %s", (ONLINE_THRESHOLD_SECONDS, device_id))
+    return cur.fetchone()
+
+
+# ============================================================================
+# 認証ヘルパー
+# ============================================================================
+# データを変更するエンドポイント（POST / PUT / PATCH / DELETE）すべてで使う。
+# 以前は POST /devices の中だけに認証チェックがあり、PUT / PATCH / DELETE は
+# 誰でも呼べてしまっていた。Depends にして、付け忘れを防ぐ。
+
+
+def require_api_key(authorization: str | None = Header(None)) -> None:
+    """Authorization: Bearer <APIキー> を確認する。違えば 401 にする。"""
+    if authorization is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization headerがありません",
+        )
+
+    # "Bearer <キー>" の形でなければ 401（以前は split(" ")[1] で 500 になっていた）
+    scheme, _, token = authorization.partition(" ")
+    if scheme != "Bearer" or token != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="APIキーが間違っています",
+        )
+
+
 # ============================================================================
 # FastAPI アプリケーション
 # ============================================================================
 
 app = FastAPI(
     title="DeviceHub",
-    version="0.2.0",
+    version="1.0.0",
     description="Windows PC のデバイス情報を管理する API（PostgreSQL 使用）",
 )
 
@@ -159,6 +220,7 @@ app = FastAPI(
     response_model=UserResponse,
     status_code=status.HTTP_201_CREATED,
     summary="ユーザーを作成する",
+    dependencies=[Depends(require_api_key)],
 )
 def create_user(user: UserCreate):
     """新しいユーザーを作成します。
@@ -193,11 +255,9 @@ def create_user(user: UserCreate):
     response_model=DeviceResponse,
     status_code=status.HTTP_201_CREATED,
     summary="デバイスを登録する",
+    dependencies=[Depends(require_api_key)],
 )
-def create_device(
-    device: DeviceCreate,
-    authorization: str | None = Header(None),
-):
+def create_device(device: DeviceCreate):
     """新しいデバイスを登録します。
 
     v0.1 との違い:
@@ -205,22 +265,8 @@ def create_device(
     - if user_id not in users → DB の FOREIGN KEY 制約が自動チェック
     - _next_device_id += 1 → SERIAL が自動採番
     - これらのチェックが DB 側に移ったので、コードがシンプルになった
+    - 認証は require_api_key（dependencies）で、関数に入る前に確認する
     """
-    # --- 認証チェック（v0.1 と同じ） ---
-    if authorization is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization headerがありません",
-        )
-
-    token = authorization.split(" ")[1]
-
-    if token != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="APIキーが間違っています",
-        )
-
     # --- DB にデバイスを登録 ---
     conn = get_db()
     try:
@@ -232,12 +278,13 @@ def create_device(
                     """
                     INSERT INTO devices (user_id, hostname, os, cpu, gpu, memory_gb)
                     VALUES (%s, %s, %s, %s, %s, %s)
-                    RETURNING id, user_id, hostname, os, cpu, gpu, memory_gb, created_at
+                    RETURNING id
                     """,
                     (device.user_id, device.hostname, device.os, device.cpu, device.gpu, device.memory_gb),
                 )
-                row = cur.fetchone()
-                return row
+                new_id = cur.fetchone()["id"]
+                # 状態（last_heartbeat_at / status）つきで返すため、改めて取り出す
+                return select_device(cur, new_id)
 
             except UniqueViolation:
                 # hostname が重複した場合（UNIQUE制約違反）
@@ -276,20 +323,20 @@ def list_devices(os: str | None = None, gpu: str | None = None):
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            # 基本のクエリ
-            query = "SELECT id, user_id, hostname, os, cpu, gpu, memory_gb, created_at FROM devices"
-            params = []
+            # 基本のクエリ（状態つき。1 つ目のパラメータは ONLINE とみなす秒数）
+            query = DEVICE_SELECT
+            params = [ONLINE_THRESHOLD_SECONDS]
             conditions = []
 
             # クエリパラメータで絞り込み条件を動的に組み立てる
             # v0.1 では Python の if でフィルタしていたが、
             # v0.2 では WHERE 句で DB 側にフィルタさせる（DBの方が速い）
             if os is not None:
-                conditions.append("os = %s")
+                conditions.append("d.os = %s")
                 params.append(os)
 
             if gpu is not None:
-                conditions.append("gpu = %s")
+                conditions.append("d.gpu = %s")
                 params.append(gpu)
 
             # 条件があれば WHERE 句を追加
@@ -297,7 +344,7 @@ def list_devices(os: str | None = None, gpu: str | None = None):
                 query += " WHERE " + " AND ".join(conditions)
 
             # ORDER BY で ID 順に並べる（v0.1 の sorted() と同じ）
-            query += " ORDER BY id"
+            query += " ORDER BY d.id"
 
             cur.execute(query, params)
             rows = cur.fetchall()
@@ -324,11 +371,7 @@ def get_device(device_id: int):
     conn = get_db()
     try:
         with conn.cursor(row_factory=dict_row) as cur:
-            cur.execute(
-                "SELECT id, user_id, hostname, os, cpu, gpu, memory_gb, created_at FROM devices WHERE id = %s",
-                (device_id,),
-            )
-            row = cur.fetchone()
+            row = select_device(cur, device_id)
 
             # 見つからなければ404（v0.1 と同じ判断）
             if row is None:
@@ -349,6 +392,7 @@ def get_device(device_id: int):
     "/devices/{device_id}",
     response_model=DeviceResponse,
     summary="デバイスを全体更新する",
+    dependencies=[Depends(require_api_key)],
 )
 def update_device(device_id: int, device: DeviceCreate):
     """デバイス情報を全体更新します。
@@ -375,12 +419,10 @@ def update_device(device_id: int, device: DeviceCreate):
                     UPDATE devices
                     SET user_id = %s, hostname = %s, os = %s, cpu = %s, gpu = %s, memory_gb = %s
                     WHERE id = %s
-                    RETURNING id, user_id, hostname, os, cpu, gpu, memory_gb, created_at
                     """,
                     (device.user_id, device.hostname, device.os, device.cpu, device.gpu, device.memory_gb, device_id),
                 )
-                row = cur.fetchone()
-                return row
+                return select_device(cur, device_id)
 
             except UniqueViolation:
                 raise HTTPException(
@@ -404,6 +446,7 @@ def update_device(device_id: int, device: DeviceCreate):
     "/devices/{device_id}",
     response_model=DeviceResponse,
     summary="デバイスを部分更新する",
+    dependencies=[Depends(require_api_key)],
 )
 def partial_update_device(device_id: int, device: DevicePatch):
     """デバイス情報を部分更新します。送られたフィールドだけ更新します。
@@ -435,11 +478,7 @@ def partial_update_device(device_id: int, device: DevicePatch):
 
             if not fields:
                 # 更新するフィールドが無い場合は現在のデータをそのまま返す
-                cur.execute(
-                    "SELECT id, user_id, hostname, os, cpu, gpu, memory_gb, created_at FROM devices WHERE id = %s",
-                    (device_id,),
-                )
-                return cur.fetchone()
+                return select_device(cur, device_id)
 
             # 動的に組み立てた UPDATE 文を実行
             # 例: UPDATE devices SET hostname = %s, memory_gb = %s WHERE id = %s
@@ -448,13 +487,11 @@ def partial_update_device(device_id: int, device: DevicePatch):
                 UPDATE devices
                 SET {', '.join(fields)}
                 WHERE id = %s
-                RETURNING id, user_id, hostname, os, cpu, gpu, memory_gb, created_at
             """
 
             try:
                 cur.execute(query, values)
-                row = cur.fetchone()
-                return row
+                return select_device(cur, device_id)
 
             except UniqueViolation:
                 raise HTTPException(
@@ -478,6 +515,7 @@ def partial_update_device(device_id: int, device: DevicePatch):
     "/devices/{device_id}",
     status_code=status.HTTP_204_NO_CONTENT,
     summary="デバイスを削除する",
+    dependencies=[Depends(require_api_key)],
 )
 def delete_device(device_id: int):
     """デバイスを削除します。
@@ -488,7 +526,11 @@ def delete_device(device_id: int):
     """
     conn = get_db()
     try:
-        with conn.cursor() as cur:
+        # heartbeats は devices を参照している（FOREIGN KEY）。先に heartbeat を消さないと、
+        # heartbeat が 1 件でもあるデバイスは消せない（ForeignKeyViolation）。
+        # 2 つの DELETE を 1 つのトランザクションにまとめ、途中で失敗したら両方取り消す
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute("DELETE FROM heartbeats WHERE device_id = %s", (device_id,))
             # DELETE しつつ、削除された行の id を取得
             # 削除対象が存在しない場合は RETURNING で何も返らない
             cur.execute("DELETE FROM devices WHERE id = %s RETURNING id", (device_id,))
@@ -501,6 +543,38 @@ def delete_device(device_id: int):
         conn.close()
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ----------------------------------------------------------------------------
+# POST /devices/{device_id}/heartbeat - 生存通知
+# ----------------------------------------------------------------------------
+@app.post(
+    "/devices/{device_id}/heartbeat",
+    response_model=DeviceResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="デバイスの生存通知（heartbeat）を記録する",
+    dependencies=[Depends(require_api_key)],
+)
+def send_heartbeat(device_id: int):
+    """エージェントが定期的に呼ぶ。heartbeats に 1 行追加し、状態つきのデバイスを返す。
+
+    最後の heartbeat から ONLINE_THRESHOLD_SECONDS 秒以内なら ONLINE、超えたら OFFLINE と判定する。
+    判定は保存せず、取り出すたびに計算する（「OFFLINE になった」ことを誰かが書き込む必要がない）。
+    """
+    conn = get_db()
+    try:
+        with conn.cursor(row_factory=dict_row) as cur:
+            try:
+                cur.execute("INSERT INTO heartbeats (device_id) VALUES (%s)", (device_id,))
+            except ForeignKeyViolation:
+                # device_id が存在しない（FOREIGN KEY制約違反）
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"device_id={device_id} のデバイスは存在しません",
+                )
+            return select_device(cur, device_id)
+    finally:
+        conn.close()
 
 
 # ----------------------------------------------------------------------------

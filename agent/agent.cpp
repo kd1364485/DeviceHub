@@ -7,6 +7,7 @@
 //   1. Windows API で PC情報を収集
 //   2. WinHTTP で HTTP POST / GET / PUT を送信
 //   3. FastAPI 側で PostgreSQL に保存される
+//   4. その後 30 秒ごとに heartbeat（生存通知）を送る。サーバーは ONLINE / OFFLINE を判定する
 //
 // コンパイル方法（UCRT64 環境）:
 //   g++ -static agent.cpp -o agent.exe -lwinhttp
@@ -45,6 +46,11 @@ const std::string API_KEY = "my-secret-key";
 
 // このエージェントが登録するユーザーの名前
 const std::string USER_NAME = "agent";
+
+// heartbeat（生存通知）を送る間隔（秒）。
+// サーバーは、最後の heartbeat から 60 秒を超えると OFFLINE と判定する。
+// 30 秒にしておけば、1 回送り損ねても ONLINE のままでいられる。
+const int HEARTBEAT_INTERVAL_SECONDS = 30;
 
 
 // ============================================================================
@@ -430,10 +436,65 @@ int find_device_id_by_hostname(const std::string& json, const std::string& hostn
 }
 
 
+// JSON の中の、最初の "id": の数字を読む（POST のレスポンスは 1 件なので、最初の id が自分）
+int parse_first_id(const std::string& json) {
+    size_t idPos = json.find("\"id\":");
+    if (idPos == std::string::npos) {
+        return -1;
+    }
+    size_t numStart = idPos + 5;
+    size_t numEnd = json.find_first_not_of("0123456789", numStart);
+    if (numEnd == numStart) {
+        return -1;
+    }
+    return std::stoi(json.substr(numStart, numEnd - numStart));
+}
+
+// JSON の中の "status":"..." の値を読む（ONLINE / OFFLINE の表示用）
+std::string parse_status(const std::string& json) {
+    const std::string key = "\"status\":\"";
+    size_t pos = json.find(key);
+    if (pos == std::string::npos) {
+        return "?";
+    }
+    size_t start = pos + key.size();
+    size_t end = json.find('"', start);
+    return json.substr(start, end - start);
+}
+
+
+// ============================================================================
+// heartbeat の送信ループ
+// ============================================================================
+// HEARTBEAT_INTERVAL_SECONDS ごとに POST /devices/{id}/heartbeat を送り続ける。
+// Ctrl+C で止める。止めると、サーバー側では 60 秒後に OFFLINE になる。
+// 送信に失敗しても（サーバーが落ちている等）止まらずに、次の回で送り直す。
+void heartbeat_loop(int deviceId) {
+    std::string path = "/devices/" + std::to_string(deviceId) + "/heartbeat";
+    std::cout << "Sending heartbeat every " << HEARTBEAT_INTERVAL_SECONDS
+              << " s (Ctrl+C to stop)" << std::endl;
+
+    while (true) {
+        HttpResult result = http_request("POST", path, "", true);   // 変更系なので認証が必要
+        if (result.status == 201) {
+            std::cout << "POST " << path << " -> 201  status=" << parse_status(result.body) << std::endl;
+        } else {
+            std::cerr << "POST " << path << " -> " << result.status << " (retry next time)" << std::endl;
+        }
+        Sleep(HEARTBEAT_INTERVAL_SECONDS * 1000);   // Windows API。ミリ秒で指定
+    }
+}
+
+
 // ============================================================================
 // main() - エージェントの処理
 // ============================================================================
-int main() {
+// 使い方:
+//   agent.exe          登録（または更新）したあと、heartbeat を送り続ける
+//   agent.exe --once   登録（または更新）だけして終わる（以前の動作）
+int main(int argc, char** argv) {
+    const bool once = (argc > 1 && std::string(argv[1]) == "--once");
+
     std::cout << "=== DeviceHub Agent ===" << std::endl;
 
     // ------------------------------------------------------------------
@@ -467,6 +528,7 @@ int main() {
     std::cout << "GET /devices -> " << result.status << std::endl;
 
     int existingDeviceId = find_device_id_by_hostname(result.body, info.hostname);
+    int deviceId = existingDeviceId;   // heartbeat を送るデバイスの ID
 
     if (existingDeviceId > 0) {
         // --------------------------------------------------------------
@@ -477,7 +539,7 @@ int main() {
         std::string body = build_device_json(1, info);
         std::string putPath = "/devices/" + std::to_string(existingDeviceId);
 
-        result = http_request("PUT", putPath, body, false);
+        result = http_request("PUT", putPath, body, true);   // 変更系なので認証が必要
         std::cout << "PUT " << putPath << " -> " << result.status << std::endl;
         std::cout << "Response: " << result.body << std::endl;
 
@@ -489,7 +551,7 @@ int main() {
 
         // Step 2a: ユーザーを作成（POST /users）
         std::string userBody = "{\"name\":\"" + USER_NAME + "\"}";
-        result = http_request("POST", "/users", userBody, false);
+        result = http_request("POST", "/users", userBody, true);   // 変更系なので認証が必要
         std::cout << "POST /users -> " << result.status << std::endl;
         std::cout << "Response: " << result.body << std::endl;
 
@@ -514,8 +576,27 @@ int main() {
         result = http_request("POST", "/devices", deviceBody, true);
         std::cout << "POST /devices -> " << result.status << std::endl;
         std::cout << "Response: " << result.body << std::endl;
+
+        if (result.status != 201) {
+            std::cerr << "Failed to register device" << std::endl;
+            return 1;
+        }
+        deviceId = parse_first_id(result.body);
     }
 
-    std::cout << "=== Done ===" << std::endl;
+    if (once) {
+        std::cout << "=== Done ===" << std::endl;
+        return 0;
+    }
+
+    if (deviceId <= 0) {
+        std::cerr << "Failed to get device id" << std::endl;
+        return 1;
+    }
+
+    // ------------------------------------------------------------------
+    // Step 3: heartbeat を送り続ける（Ctrl+C で終了）
+    // ------------------------------------------------------------------
+    heartbeat_loop(deviceId);
     return 0;
 }

@@ -21,4 +21,8 @@ create  table heartbeats(
     created_at timestamptz not null default now()
 );
 
+-- デバイスごとの最新の heartbeat を探す(GET /devices で毎回使う)ための索引。
+-- エージェントは 30 秒ごとに 1 行足すので、行は増え続ける。索引がないと、全行を読むことになる
+create index heartbeats_device_created on heartbeats (device_id, created_at desc);
+
 

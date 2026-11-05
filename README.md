@@ -1,6 +1,11 @@
 # DeviceHub
 
+![エージェントの登録 → heartbeat で ONLINE → 停止して 60 秒後に OFFLINE](docs/demo.gif)
+
+*左: C++ のエージェント、右: API の画面(Swagger UI)。空の一覧 → エージェントを起動して登録・heartbeat → `ONLINE` → Ctrl+C で停止 → 60 秒後に `OFFLINE`(待ち時間は 16 倍速)。動画版: [docs/demo.mp4](docs/demo.mp4)*
+
 Windows PC のデバイス情報（ホスト名・OS・CPU・GPU・メモリ）を、C++ 製エージェントが収集し、FastAPI バックエンド経由で PostgreSQL に登録・管理するシステムです。
+エージェントは登録後も 30 秒ごとに heartbeat（生存通知）を送り、サーバーは各 PC が **ONLINE / OFFLINE** かを判定します（最後の heartbeat から 60 秒以内なら ONLINE）。
 
 クライアント（C++ / WinHTTP）→ API サーバー（FastAPI）→ DB（PostgreSQL）→ インフラ（Docker / AWS）→ CI（GitHub Actions）まで、Web システムの一通りの層を自分で実装した学習プロジェクトです。
 
@@ -56,14 +61,24 @@ Swagger UI で `/docs` から対話的に確認できます。
 
 | メソッド | パス | 説明 | 認証 |
 |---------|------|------|------|
-| POST | `/users` | ユーザー作成 | 不要 |
+| POST | `/users` | ユーザー作成 | APIキー必須 |
 | POST | `/devices` | デバイス登録 | APIキー必須 |
 | GET | `/devices` | デバイス一覧（`?os=` `?gpu=` で絞り込み可） | 不要 |
 | GET | `/devices/{id}` | 個別取得 | 不要 |
-| PUT | `/devices/{id}` | 全体更新 | 不要 |
-| PATCH | `/devices/{id}` | 部分更新 | 不要 |
-| DELETE | `/devices/{id}` | 削除 | 不要 |
+| PUT | `/devices/{id}` | 全体更新 | APIキー必須 |
+| PATCH | `/devices/{id}` | 部分更新 | APIキー必須 |
+| DELETE | `/devices/{id}` | 削除（そのデバイスの heartbeat も消す） | APIキー必須 |
+| POST | `/devices/{id}/heartbeat` | 生存通知を記録し、状態つきのデバイスを返す | APIキー必須 |
 | GET | `/health` | ヘルスチェック | 不要 |
+
+デバイスを返す API は、すべて `last_heartbeat_at`（最後の heartbeat の時刻。無ければ `null`）と `status`（`ONLINE` / `OFFLINE`）を含みます。
+状態は保存せず、取り出すたびに DB の `NOW()` と比べて計算します。「OFFLINE になった」と誰かが書き込む必要がなく、アプリと DB の時計がずれても判定がぶれません。
+しきい値は環境変数 `ONLINE_THRESHOLD_SECONDS`（既定 60 秒）で変えられます。
+
+**データを変更する API は、すべて API キーが必要**です（`Authorization: Bearer <キー>`）。
+以前は `POST /devices` だけに認証があり、更新・削除は誰でもできてしまっていました（2026/11/05 に修正）。
+認証は FastAPI の `Depends`（`require_api_key`）にまとめ、エンドポイントごとの付け忘れを防いでいます。
+キーは環境変数 `API_KEY` で渡します（未設定なら学習用の固定値 `my-secret-key`）。
 
 ### エージェントの動作フロー
 
@@ -74,10 +89,24 @@ agent.exe 起動
    │
    ├─ GET /devices で自分の hostname が登録済みか確認
    │
-   ├─ 未登録 → POST /users → POST /devices (Authorization: Bearer <key>)
+   ├─ 未登録 → POST /users → POST /devices (どちらも Authorization: Bearer <key>)
    │
-   └─ 登録済み → PUT /devices/{id} で最新情報に更新
-   （同じ PC を何度起動しても重複登録されない）
+   ├─ 登録済み → PUT /devices/{id} で最新情報に更新 (Authorization: Bearer <key>)
+   │  （同じ PC を何度起動しても重複登録されない）
+   │
+   └─ 30 秒ごとに POST /devices/{id}/heartbeat（Ctrl+C で終了。送信に失敗しても次の回で送り直す）
+```
+
+`agent.exe --once` とすると、heartbeat を送らず、登録（または更新）だけで終わります（以前の動作）。
+
+実際に動かした結果（2026/11/05、WSL2 の PostgreSQL のテスト用 DB）:
+
+```
+POST /devices -> 201
+Sending heartbeat every 30 s (Ctrl+C to stop)
+POST /devices/3/heartbeat -> 201  status=ONLINE     ← 3 回送信。この間 GET /devices は ONLINE
+（エージェントを停止して 70 秒後）
+GET /devices → 3 YMANOHA OFFLINE                       ← 60 秒を超えたので OFFLINE
 ```
 
 ## データベース設計
@@ -102,6 +131,10 @@ users                    devices                  heartbeats
 - `user_id` / `device_id` は FOREIGN KEY で親テーブルの存在を保証
 - `memory_gb` は CHECK 制約で `> 0` を強制
 - 制約違反は psycopg の `UniqueViolation` / `ForeignKeyViolation` を捕捉し、それぞれ 400 / 404 の HTTP エラーに変換
+- `heartbeats` は 30 秒ごとに行が増え続けるので、`(device_id, created_at desc)` の索引で、デバイスごとの最新の 1 件を速く探す（`LEFT JOIN LATERAL` で各デバイスの最新時刻を求める）
+- デバイスの削除は、`heartbeats` → `devices` の順に、1 つのトランザクションで消す（FOREIGN KEY があるので、逆の順だと消せない）
+
+既にある DB（ローカルや RDS）には、索引を手で追加します: `create index heartbeats_device_created on heartbeats (device_id, created_at desc);`
 
 ## Docker 構成
 
@@ -151,7 +184,7 @@ schema.sql でテーブル作成
 pytest test_main.py -v   ← 実 DB への書き込みを含むテスト
 ```
 
-テストは認証エラー（401）・バリデーションエラー（422）・404 に加え、ユーザー作成 → デバイス登録 → 一覧取得という実 DB を使った結合テストまでカバーしています。
+テストは認証エラー（401。変更系の全エンドポイントと、形の崩れたヘッダー）・バリデーションエラー（422）・404 に加え、ユーザー作成 → デバイス登録 → 一覧取得 → 更新 → 部分更新 → 削除という実 DB を使った結合テスト、heartbeat の ONLINE / OFFLINE の判定（しきい値を 0 秒にして時間切れを再現）までカバーしています（16 件）。
 
 ## 苦労した点と解決策
 
@@ -186,10 +219,28 @@ v0.1 では Python の辞書で保持し、重複チェック・存在チェッ�
 
 - **解決**: UNIQUE / FOREIGN KEY / CHECK 制約にロジックを委譲し、アプリ側は psycopg の例外を HTTP エラーに写像するだけに簡素化。サーバー再起動でデータが消える問題も解消
 
+### 6. 更新・削除に認証がなかった（2026/11/05 に修正）
+
+API 表を見直したとき、認証があるのは `POST /devices` だけで、`PUT` / `PATCH` / `DELETE` と `POST /users` は、キーなしで誰でも呼べる状態だと気づきました。
+登録だけ守っても、更新や削除が開いていれば、データは守れていません。また、`Authorization` ヘッダーが `Bearer <キー>` の形でないと、`split(" ")[1]` が例外を投げて 500 になっていました。
+
+- **解決**: 認証チェックを `require_api_key` にまとめ、変更系のすべてのエンドポイントに `dependencies=[Depends(require_api_key)]` で付けた。形の崩れたヘッダーも 401 にした。エージェントの `POST /users` と `PUT` にもキーを付けた
+- **確認**: キーなしの変更系がすべて 401 になるテストを追加し、13 件すべて通った。実際のサーバー（WSL2 の PostgreSQL、テスト用の DB）に対して、エージェントを 2 回実行し、1 回目は登録（`POST /devices -> 201`）、2 回目は更新（`PUT /devices/1 -> 200`）になることを確かめた。キーなしの `PUT` / `DELETE` は 401
+
+### 7. heartbeat と ONLINE / OFFLINE（2026/11/05 に実装）
+
+計画（11〜12 週）にあった「30 秒ごとの heartbeat」と「60 秒で OFFLINE」が、テーブルだけで動いていませんでした。
+
+- **状態を保存しない**: `status` 列を作って更新する方法だと、「止まったエージェント」は自分で OFFLINE と書けないので、別の見張り役が要る。そこで、最後の heartbeat の時刻だけを記録し、取り出すたびに DB の `NOW()` と比べて判定するようにした
+- **削除が失敗する問題**: heartbeat の行があるデバイスは、FOREIGN KEY のために削除できなくなる。`heartbeats` を先に消し、2 つの DELETE を 1 つのトランザクションにまとめた
+- **確認**: テストで、登録直後 OFFLINE → heartbeat で ONLINE → しきい値切れで OFFLINE → 削除できる、を確かめた。実機でも、エージェントを止めて 70 秒後に OFFLINE になった（上の「実際に動かした結果」）
+
 ## 今後の改善点（残課題）
 
-- `heartbeats` テーブルは作成済みだが、エージェント側の定期 heartbeat 送信と `POST /devices/heartbeat` エンドポイントは未実装
-- API キーがコード内の固定値 → 環境変数・シークレット管理への移行
+- heartbeat の行は消さないので増え続ける（1 台 30 秒ごと = 1 日 2,880 行）。古い行を定期的に消すか、最新時刻だけを `devices` に持つ設計に変える
+- エージェントの更新（PUT）は `user_id` を 1 に固定して送っている。ユーザー 1 が存在しない DB では、更新が 404 になる
+- API キーは、サーバー側は環境変数 `API_KEY` で渡せるようにした。ただし、未設定のときの既定値と、エージェント側（`agent.cpp`）は、まだコード内の固定値 → シークレット管理への移行
+- API キーが 1 つだけで、全員が同じキーを使う（ユーザーごとのキーや、権限の区別はない）
 - エージェント ⇔ EC2 間が HTTP 平文 → HTTPS 化（ALB + ACM、またはリバースプロキシ）
 - デプロイは手作業 → GitHub Actions からの自動デプロイ（build → push → deploy）への拡張
 
