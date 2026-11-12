@@ -24,8 +24,15 @@ import os
 DB_URL = os.environ.get("DB_URL", "host=127.0.0.1 port=5432 dbname=devicehub user=postgres password=devicehub")
 
 # APIキー（認証用）
-# 環境変数 API_KEY があればそれを使う。無ければ学習用の固定値（本番では必ず環境変数で渡す）
-API_KEY = os.environ.get("API_KEY", "my-secret-key")
+# 環境変数 API_KEY で渡す(16 文字以上のランダムな値)。未設定、または短いときは、サーバーを起動しない。
+# 以前は、未設定なら学習用の固定値を使っていたが、やめた: 値がコードに書いてあると、知っている人は
+# 誰でも書き込める。しかも、設定を忘れても動いてしまうので、気づけない(失敗するほうに倒す)。
+API_KEY = os.environ.get("API_KEY", "")
+if len(API_KEY) < 16:
+    raise RuntimeError(
+        "API_KEY environment variable is not set or too short (16+ random characters required). "
+        "See README: Setup. / 環境変数 API_KEY が未設定、または短すぎます(README のセットアップを参照)。"
+    )
 
 # 最後の heartbeat からこの秒数以内なら ONLINE、超えたら OFFLINE
 # エージェントは 30 秒ごとに送るので、1 回取りこぼしても ONLINE のままになる長さにしている

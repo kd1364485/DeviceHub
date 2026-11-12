@@ -78,7 +78,7 @@ Swagger UI で `/docs` から対話的に確認できます。
 **データを変更する API は、すべて API キーが必要**です（`Authorization: Bearer <キー>`）。
 以前は `POST /devices` だけに認証があり、更新・削除は誰でもできてしまっていました（2026/11/05 に修正）。
 認証は FastAPI の `Depends`（`require_api_key`）にまとめ、エンドポイントごとの付け忘れを防いでいます。
-キーは環境変数 `API_KEY` で渡します（未設定なら学習用の固定値 `my-secret-key`）。
+キーは環境変数 `API_KEY`（16 文字以上のランダムな値）で渡します。**未設定、または短いときは、サーバーが起動しません。** エージェントは、環境変数 `DEVICEHUB_API_KEY`（サーバーと同じ値）から読みます。
 
 ### エージェントの動作フロー
 
@@ -148,8 +148,12 @@ users                    devices                  heartbeats
 - `pgdata` ボリュームで DB データを永続化
 - `schema.sql` を `/docker-entrypoint-initdb.d/` にマウントし、初回起動時にテーブルを自動作成
 - `backend` の `DB_URL` は `host=db` — Compose のサービス名でコンテナ間通信
+- `API_KEY` は、`.env`（`.env.example` を写して作る。Git には上げない）か環境変数で渡す。未設定だと、`docker compose` がエラーで止まる
+- ポート（5432 と 8000）は、`127.0.0.1` だけに開く。付けないと、同じネットワークや、クラウドで動かしたときのインターネットから、DB（パスワードは開発用の値）に届いてしまう
 
 ## AWS 構成
+
+※ この構成は、以前の版で構築して動作を確認したものです。今は、AWS 上の環境は使っていません。
 
 - **EC2**: FastAPI をホスティング。ローカル PC をシャットダウンしても API が動き続ける
 - **RDS（PostgreSQL）**: マネージド DB。ローカルの PostgreSQL コンテナと同じ `schema.sql` を適用
@@ -235,11 +239,19 @@ API 表を見直したとき、認証があるのは `POST /devices` だけで�
 - **削除が失敗する問題**: heartbeat の行があるデバイスは、FOREIGN KEY のために削除できなくなる。`heartbeats` を先に消し、2 つの DELETE を 1 つのトランザクションにまとめた
 - **確認**: テストで、登録直後 OFFLINE → heartbeat で ONLINE → しきい値切れで OFFLINE → 削除できる、を確かめた。実機でも、エージェントを止めて 70 秒後に OFFLINE になった（上の「実際に動かした結果」）
 
+### 8. 既定のキーを、コードに書いていた（2026/11/12 に修正）
+
+公開する前にリポジトリを見直して、次のことに気づきました。サーバーの `API_KEY` は、未設定なら学習用の固定値で動くこと。エージェント（`agent.cpp`）には、その値が直接書いてあること。`docker compose` が、DB と API のポートを、そのまま外に開いていること。値がコードに書いてあると、知っている人は誰でも書き込めます。そして、設定を忘れても動いてしまうので、気づけません。
+
+- **解決**: サーバーは、`API_KEY`（16 文字以上）が未設定、または短いと、起動しない（失敗するほうに倒す）。エージェントは、環境変数 `DEVICEHUB_API_KEY` から読む。`docker-compose.yml` は、`.env` から `API_KEY` を必須で受け取る。テストと CI は、テスト専用の値を使う。ポートは `127.0.0.1` だけに閉じた。古い版（v0.1）の控えは、リポジトリから外した
+- **確認**: 「鍵が未設定、短いと、起動しない」テストを足して、18 件すべて通った。実際に、サーバーとエージェントを動かして、正しい鍵なら登録（`POST /devices -> 201`）と更新（`PUT -> 200`）ができ、違う鍵や鍵なしなら 401 になることを確かめた
+- **残っていること**: 履歴には、昔の学習用の値が残っている。例の値で、本物の環境では使っていない
+
 ## 今後の改善点（残課題）
 
 - heartbeat の行は消さないので増え続ける（1 台 30 秒ごと = 1 日 2,880 行）。古い行を定期的に消すか、最新時刻だけを `devices` に持つ設計に変える
 - エージェントの更新（PUT）は `user_id` を 1 に固定して送っている。ユーザー 1 が存在しない DB では、更新が 404 になる
-- API キーは、サーバー側は環境変数 `API_KEY` で渡せるようにした。ただし、未設定のときの既定値と、エージェント側（`agent.cpp`）は、まだコード内の固定値 → シークレット管理への移行
+- API キーは、環境変数で渡す（コードには書かない）。AWS の Secrets Manager などの、シークレット管理への移行は、まだ
 - API キーが 1 つだけで、全員が同じキーを使う（ユーザーごとのキーや、権限の区別はない）
 - エージェント ⇔ EC2 間が HTTP 平文 → HTTPS 化（ALB + ACM、またはリバースプロキシ）
 - デプロイは手作業 → GitHub Actions からの自動デプロイ（build → push → deploy）への拡張
@@ -247,17 +259,24 @@ API 表を見直したとき、認証があるのは `POST /devices` だけで�
 ## セットアップ
 
 ```bash
+# API キーを作る(PowerShell。16 文字以上のランダムな値)
+$b = New-Object byte[] 24; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)
+# → .env.example を .env に写して、API_KEY=<作った値> と書く(.env は Git に上げない)
+
 # Docker で全部起動（API + PostgreSQL）
 docker compose up --build
 
 # API ドキュメント
 # http://127.0.0.1:8000/docs
 
-# テスト（要 PostgreSQL）
+# テスト（要 PostgreSQL。API_KEY は、テストが専用の値を使うので、設定しなくてよい）
 python -m pytest test_main.py -v
 
 # エージェントのビルド（MSYS2 UCRT64）
 g++ -static agent/agent.cpp -o agent/agent.exe -lwinhttp
+
+# エージェントの実行（サーバーと同じ鍵を、環境変数で渡す）
+$env:DEVICEHUB_API_KEY = '<サーバーと同じ値>'; agentgent.exe
 ```
 
 ## このプロジェクトで学んだこと

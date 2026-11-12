@@ -21,6 +21,13 @@ GitHub Actions で push 時に自動実行されます。
 # インポート
 # ============================================================================
 
+import os
+
+# テスト専用のキー。本物の値ではない(main.py は、読み込むときに API_KEY を要求するので、先に設定する)。
+# すでに環境変数 API_KEY があれば、それを使う。
+os.environ.setdefault("API_KEY", "test-api-key-for-pytest-only")
+TEST_API_KEY = os.environ["API_KEY"]
+
 # TestClient: FastAPI アプリを「本物のサーバーを立ち上げずに」テストするツール
 # 内部的には httpx を使って、アプリに直接リクエストを送る
 from fastapi.testclient import TestClient
@@ -38,7 +45,7 @@ from main import app
 client = TestClient(app)
 
 # 正しい API キーのヘッダー（main.py の API_KEY と同じ値）
-AUTH = {"Authorization": "Bearer my-secret-key"}
+AUTH = {"Authorization": f"Bearer {TEST_API_KEY}"}
 
 
 # ============================================================================
@@ -123,7 +130,7 @@ def test_malformed_auth_header():
     """"Bearer <キー>" の形でないヘッダーは 401 になるかテスト（以前は 500 だった）。"""
     response = client.post(
         "/devices",
-        headers={"Authorization": "my-secret-key"},   # "Bearer " が無い
+        headers={"Authorization": TEST_API_KEY},   # "Bearer " が無い
         json=VALID_DEVICE,
     )
     assert response.status_code == 401
@@ -184,7 +191,7 @@ def test_create_device_invalid_memory():
     """
     response = client.post(
         "/devices",
-        headers={"Authorization": "Bearer my-secret-key"},
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
         json={
             "user_id": 1,
             "hostname": "test-pc",
@@ -206,7 +213,7 @@ def test_create_device_missing_hostname():
     """
     response = client.post(
         "/devices",
-        headers={"Authorization": "Bearer my-secret-key"},
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
         json={
             "user_id": 1,
             # hostname が欠けている
@@ -246,7 +253,7 @@ def test_create_user_and_get_devices():
     # Step 2: デバイス登録（認証あり）
     response = client.post(
         "/devices",
-        headers={"Authorization": "Bearer my-secret-key"},
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
         json={
             "user_id": user_id,
             "hostname": "ci-test-pc",
@@ -350,3 +357,38 @@ def test_heartbeat_online_offline(monkeypatch):
     response = client.delete(f"/devices/{device_id}", headers=AUTH)
     assert response.status_code == 204
     assert client.get(f"/devices/{device_id}").status_code == 404
+
+
+# ============================================================================
+# テスト: API キーが未設定、または短いと、サーバーは起動しない（DB不要）
+# ============================================================================
+
+def _import_main_with_env(api_key):
+    """別のプロセスで main.py を読み込み、終了コードとエラー出力を返す。
+    api_key が None なら、環境変数 API_KEY を外す。"""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "API_KEY"}
+    if api_key is not None:
+        env["API_KEY"] = api_key
+    result = subprocess.run(
+        [sys.executable, "-c", "import main"],
+        env=env, capture_output=True, text=True,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+    return result.returncode, result.stderr
+
+
+def test_server_refuses_to_start_without_api_key():
+    """API_KEY が未設定なら、読み込みの時点で失敗する（既定の鍵で動いてしまわない）。"""
+    code, err = _import_main_with_env(None)
+    assert code != 0
+    assert "API_KEY" in err
+
+
+def test_server_refuses_to_start_with_short_api_key():
+    """短すぎる鍵（推測しやすい）でも、起動しない。"""
+    code, err = _import_main_with_env("short")
+    assert code != 0
+    assert "API_KEY" in err

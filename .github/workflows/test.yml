@@ -111,4 +111,6 @@ jobs:
       - name: Run tests
         env:
           DB_URL: "host=localhost port=5432 dbname=devicehub user=postgres password=devicehub"
+          # テスト専用の値(本物の鍵ではない)。main.py は、API_KEY が無いと起動しないので、渡す
+          API_KEY: "ci-test-api-key-not-a-secret"
         run: python -m pytest test_main.py -v

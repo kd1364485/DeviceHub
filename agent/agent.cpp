@@ -41,8 +41,15 @@ const std::wstring API_HOST = L"127.0.0.1";
 const int API_PORT = 8000;
 
 // APIキー（FastAPI 側の API_KEY と同じ値）
-// ※学習用の固定値。本番では環境変数や設定ファイルで管理します。
-const std::string API_KEY = "my-secret-key";
+// 環境変数 DEVICEHUB_API_KEY から読む。以前は、学習用の固定値をコードに書いていたが、
+// 公開するコードに鍵を書かないために、やめた。未設定のときは、main() の最初で、メッセージを出して終わる。
+static std::string load_api_key() {
+    char buf[256];
+    DWORD n = GetEnvironmentVariableA("DEVICEHUB_API_KEY", buf, sizeof(buf));
+    if (n == 0 || n >= sizeof(buf)) return "";
+    return std::string(buf, n);
+}
+const std::string API_KEY = load_api_key();
 
 // このエージェントが登録するユーザーの名前
 const std::string USER_NAME = "agent";
@@ -494,6 +501,12 @@ void heartbeat_loop(int deviceId) {
 //   agent.exe --once   登録（または更新）だけして終わる（以前の動作）
 int main(int argc, char** argv) {
     const bool once = (argc > 1 && std::string(argv[1]) == "--once");
+
+    if (API_KEY.empty()) {
+        std::cerr << "DEVICEHUB_API_KEY is not set." << std::endl;
+        std::cerr << "Set it to the same value as the server's API_KEY (see README: Setup)." << std::endl;
+        return 1;
+    }
 
     std::cout << "=== DeviceHub Agent ===" << std::endl;
 

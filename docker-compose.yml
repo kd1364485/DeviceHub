@@ -9,17 +9,22 @@ services:              # コンテナの定義開始
       - pgdata:/var/lib/postgresql/data              # DBデータをVolumeに保存
       - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql  # 初回起動時にschema.sqlを自動実行
     ports:
-      - "5432:5432"    # ホスト:5432 → コンテナ:5432
+      # 127.0.0.1 を付けて、自分の PC の中だけに閉じる。付けないと、同じネットワークの他の機器や、
+      # クラウドで動かしたときはインターネットから、DB(パスワードは開発用の値)に届いてしまう
+      - "127.0.0.1:5432:5432"    # ホスト:5432 → コンテナ:5432
 
   backend:             # FastAPIコンテナ（サービス名: backend）
     build: .           # カレントディレクトリのDockerfileからイメージをビルド
     ports:
-      - "8000:8000"    # ホスト:8000 → コンテナ:8000
+      - "127.0.0.1:8000:8000"    # ホスト:8000 → コンテナ:8000(自分の PC の中だけ)
     depends_on:
       - db             # dbコンテナが先に起動してからbackendを起動
     environment:
       DB_URL: "host=db port=5432 dbname=devicehub user=postgres password=devicehub"
                         # ↑ host=db が重要！コンテナネットワーク内のサービス名で通信する
+      # API キー: 必須。.env ファイル(.env.example を写して作る。Git には上げない)か、環境変数で渡す。
+      # 未設定のままだと、docker compose がエラーで止まる
+      API_KEY: ${API_KEY:?API_KEY が未設定です。.env に API_KEY=<16 文字以上のランダムな値> を書いてください}
 
 volumes:               # Volume定義（トップレベル）
   pgdata:              # pgdataという名前のVolumeを作成
